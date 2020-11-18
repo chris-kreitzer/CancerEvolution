@@ -1,1 +1,314 @@
-## Test
+## MutationTimeR: Gerstung lab ~ modify code, so that this algorithm can be run with Facets | Impact data
+## https://github.com/gerstung-lab/MutationTimeR; timing of somatic alterations relative to WGD
+
+## Modified: 10/24/2020
+## Author: Chris Kreitzer
+
+
+## MutationTimeR package from Github
+# devtools::install_github("gerstung-lab/MutationTimeR", force = T)
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+BiocManager::install("VariantAnnotation")
+
+library(VariantAnnotation)
+library(MutationTimeR)
+library(S4Vectors)
+library(GenomicRanges)
+
+
+###############################################################################
+## loading data for analysis
+## clear-clear renal carcinoma cases:
+Sample.List = readxl::read_excel(path = '~/Documents/MSKCC/05_IMPACT40K/Data/40k_Samples_List_for_Cancer_Type_Review.xlsx', sheet = 1, na = 'NA')
+ccRenal = Sample.List$SAMPLE_ID[which(Sample.List$CANCER_TYPE == 'Renal Cell Carcinoma')]
+maf.all = read.csv(file = '~/Documents/MSKCC/05_IMPACT40K/Data/data_mutations_extended.somatic.oncokb.vep.maf', sep = '\t')
+cc.maf = maf.all[maf.all$Tumor_Sample_Barcode %in% ccRenal,, drop = F]
+cn.data = read.csv(file = '~/Documents/MSKCC/05_IMPACT40K/Data/Facets_Paths.txt', sep = '\t')
+facet.annotation = read.csv('~/Documents/MSKCC/05_IMPACT40K/Data/msk_impact_facets_annotated.ccf.maf', sep = '\t')
+
+# VCF header: required for function below:
+header.vcf = c(
+'##fileformat=VCFv4.1
+##source=VariantAnnotation 1.20.3
+##phasing=unphased
+##fileDate=20200210
+##FORMAT=<ID=AD,Number=2,Type=Integer,Description="Allelic depths (number of reads in each observed allele)">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Total read depth">
+##FORMAT=<ID=FT,Number=1,Type=String,Description="Variant filters">
+##INFO=<ID=t_ref_count,Number=1,Type=Integer,Description="Tumour ref count">
+##INFO=<ID=t_alt_count,Number=1,Type=Integer,Description="Tumour alt count">
+##contig=<ID=1>
+##contig=<ID=2>
+##contig=<ID=3>
+##contig=<ID=4>
+##contig=<ID=5>
+##contig=<ID=6>
+##contig=<ID=7>
+##contig=<ID=8>
+##contig=<ID=9>
+##contig=<ID=10>
+##contig=<ID=11>
+##contig=<ID=12>
+##contig=<ID=13>
+##contig=<ID=14>
+##contig=<ID=15>
+##contig=<ID=16>
+##contig=<ID=17>
+##contig=<ID=18>
+##contig=<ID=19>
+##contig=<ID=20>
+##contig=<ID=21>
+##contig=<ID=22>
+##contig=<ID=X>')
+
+
+########################################################
+##### EXAMPLE LIST; patients ###########################
+set.seed(261)
+examples = sample(x = ccRenal, size = 200)
+########################################################
+
+
+## Data preparation for MutationTimeR is divided into three main steps:
+## A) create VCF file from MAF <data_mutations_extended.somatic.oncokb.vep.maf>
+## B) fetch cncf from Juno in respective folder
+## B1) run bash script to obtain cncf files
+## C) run MutationTimeR with the input parameters provided above
+
+
+###############################################################################
+## A) create VCF files for later analysis
+create.vcf = function(maf.input, sample.list, base.directory = '~/Documents/MSKCC/05_IMPACT40K/tmp/'){
+  maf.in = as.data.frame(maf.input)
+  sample.list = as.character(sample.list)
+  
+  for(i in 1:length(sample.list)){
+    # print(sample.list[i]
+    
+    # if sample is not in maf file; jump to next one
+    if(!sample.list[i] %in% maf.in$Tumor_Sample_Barcode) next
+    
+    ## create a directory for every sample to locate vcf file and output in there
+    dir.create(path = paste0(base.directory, sample.list[i]))
+    file.create(paste0(base.directory, sample.list[i], '/', sample.list[i], '.vcf'), showWarnings = F)
+    
+    ## select data from maf
+    maf.selection = maf.in[maf.in$Tumor_Sample_Barcode == sample.list[i],, drop = F]
+    maf.selection$t_ref_count = as.numeric(as.character(maf.selection$t_ref_count))
+    maf.selection$t_alt_count = as.numeric(as.character(maf.selection$t_alt_count))
+    
+    # manually create VCF
+    # see structure in https://github.com/gerstung-lab/MutationTimeR/tree/master/inst/extdata
+    cc.vcf = data.frame(CHROM = maf.selection$Chromosome,
+                        POS = maf.selection$Start_Position,
+                        ID = '.',
+                        REF = 'N',
+                        ALT = 'A',
+                        QUAL = '.',
+                        Filter = '.',
+                        INFO = paste0('t_alt_count=', maf.selection$t_alt_count, 
+                                      ';t_ref_count=', maf.selection$t_ref_count),
+                        FORMAT = 'AD:DP',
+                        SAMPLE = paste0('.,', maf.selection$t_alt_count, ':', 
+                                        (maf.selection$t_ref_count + maf.selection$t_alt_count)))
+    
+    # modify chromosome X | 23:
+    cc.vcf$CHROM = ifelse(cc.vcf$CHROM == 'X', 23, cc.vcf$CHROM)
+    
+    cc.vcf$CHROM = as.numeric(as.character(cc.vcf$CHROM))
+    
+    # order data according to Chromosome and then position
+    cc.vcf = cc.vcf[order(cc.vcf$CHROM, cc.vcf$POS), ]
+    cc.vcf$CHROM = ifelse(cc.vcf$CHROM == 23, 'X', cc.vcf$CHROM)
+    
+    # add hashtag to first column name; required for readVCF
+    colnames(cc.vcf)[1] = paste0('#', colnames(cc.vcf)[1])
+    
+    ## append header, neccessary for readVCF
+    add.header = function(x, file, header, f = write.table){
+      # create and open the file connection
+      datafile = file(file, open = 'wt')
+      # close on exit
+      on.exit(close(datafile))
+      # if a header is defined, write it to the file
+      if(!missing(header)) writeLines(header, con = datafile)
+      # write the file using the defined function and required addition arguments  
+      f(x, datafile, sep = '\t', quote = F, row.names = F)
+    }
+    
+    add.header(x = cc.vcf, file = paste0(base.directory, sample.list[i], '/', sample.list[i], '.vcf'), header = header.vcf)
+    
+  }
+  
+}
+
+create.vcf(maf.input = cc.maf, sample.list = examples)
+
+
+## B) function to create file to fetch cncf data from cluster
+
+fetch.cncf = function(sample.list){
+  cncf.paths = c()
+
+  for(path in 1:length(sample.list)){
+    correct.path = facet.annotation[facet.annotation$Tumor_Sample_Barcode == sample.list[path], 'cncf_file_used']
+    correct.path = unique(correct.path)
+    
+    if(length(correct.path) == 0) next
+    
+    else {
+      ii = paste0('xjuno:', correct.path)
+    }
+    
+    cncf.paths = c(cncf.paths, ii)
+  }
+  
+  cncf = data.frame(cluster = cncf.paths)
+  id = stringr::str_extract(string = cncf$cluster, pattern = 'P-[0-9]{7}-T[0-9]{2}-IM[0-9]{1}')
+  
+  cncf$tmp = paste0('/Users/chriskreitzer/Documents/MSKCC/05_IMPACT40K/tmp/', id)
+  
+  write.table(x = cncf, file = paste0('~/Documents/MSKCC/05_IMPACT40K/tmp/cncf.paths.txt'), 
+              sep = '\t', quote = F, row.names = F, col.names = F)
+
+}
+
+fetch.cncf(sample.list = examples)
+
+
+
+###############################################################################
+## C) function to run MutationTimeR in parallel
+run.mutationTime = function(vcf.path, individual.samples = NULL){
+  
+  all.dir = list.dirs(path = vcf.path, recursive = F)
+  
+  if(!is.null(individual.samples)){
+    paths = c()
+    for(files in 1:length(individual.samples)){
+      # grep just one samples
+      ii = grep(pattern = individual.samples[files], x = all.dir, value = T)
+      paths = c(paths, ii)
+    }
+    
+    # prepare VCF files
+    for(i in 1:length(paths)){
+      vcf.file = list.files(path = paths[i], pattern = '*.vcf', full.names = T, recursive = F)
+      cn.file = list.files(path = paths[i], pattern = '*.txt', full.names = T, recursive = F)
+      
+      # load VCF file
+      vcf = MutationTimeR::readVcf(file = vcf.file)
+      vcf = expand(vcf)
+      
+      
+      # load cncf data
+      # fetch purity and ploidy values:
+      sample.id = unique(stringr::str_extract(string = vcf.file, pattern = 'P-[0-9]{7}-T[0-9]{2}-IM[0-9]{1}'))
+      
+      # purity
+      purity = cn.data[grep(sample.id, cn.data$tumor_sample), 'purity']
+      purity = ifelse(is.na(purity), 0.001, purity)
+      purity = unique(which.max(purity))
+      
+      # ploidy
+      ploidy = cn.data[grep(sample.id, cn.data$tumor_sample), 'ploidy']
+      ploidy = ifelse(is.na(ploidy), 0.001, ploidy)
+      ploidy = unique(which.max(ploidy))
+      
+      # wgd
+      wgd = cn.data[grep(sample.id, cn.data$tumor_sample), 'wgd']
+      wgd = ifelse(length(wgd) > 1, wgd[1], wgd)
+      wgd = unique(wgd)
+      
+      
+      ## prepare facets cncf fitted files
+      cn.data.individual = read.csv(file = cn.file, sep = '\t')
+      
+      CNA.df = data.frame(seqnames = cn.data.individual$chrom,
+                          start = cn.data.individual$loc.start,
+                          end = cn.data.individual$loc.end,
+                          width = (cn.data.individual$loc.end - cn.data.individual$loc.start) + 1,
+                          strand = '*',
+                          major_cn = cn.data.individual$tcn.em - cn.data.individual$lcn.em, 
+                          minor_cn = cn.data.individual$lcn.em, 
+                          clonal_frequency = purity)
+      
+      ## downstream modifications
+      rownames(CNA.df) = NULL
+      CNA.df = CNA.df[!duplicated(CNA.df$start), ]
+      CNA.df = CNA.df[order(CNA.df$seqnames, CNA.df$start), ]
+      CNA.df$major_cn = as.integer(as.numeric(CNA.df$major_cn))
+      CNA.df$minor_cn = as.integer(as.numeric(CNA.df$minor_cn))
+      CNA.df$clonal_frequency = as.numeric(as.character(CNA.df$clonal_frequency))
+      CNA.df$seqnames = ifelse(CNA.df$seqnames == 23, 'X', CNA.df$seqnames)
+      #CNA.df = CNA.df[!CNA.df$seqnames == 'X', ]
+      row.names(CNA.df) = seq(from = 1, to = nrow(CNA.df), by = 1)
+      
+      # prepare GRobject
+      cn.GRanges = makeGRangesFromDataFrame(CNA.df, 
+                                            keep.extra.columns = T, 
+                                            seqnames.field = c("seqnames"), 
+                                            starts.in.df.are.0based = T)
+      
+      if(wgd){
+        mt.calculated = MutationTimeR::mutationTime(vcf = vcf, cn = cn.GRanges, , isWgd = TRUE, n.boot = 50)
+        info(header(vcf)) = rbind(info(header(vcf)),mtHeader())
+        info(vcf) = cbind(info(vcf), mt.calculated$V)
+        vcf.out = as.data.frame(info(vcf))
+        vcf.timing = as.data.frame(mt.calculated$T)
+        
+      } else {
+        mt.calculated = MutationTimeR::mutationTime(vcf = vcf, cn = cn.GRanges, , isWgd = FALSE, n.boot = 50)
+        info(header(vcf)) = rbind(info(header(vcf)),mtHeader())
+        info(vcf) = cbind(info(vcf), mt.calculated$V)
+        vcf.out = as.data.frame(info(vcf))
+        vcf.timing = as.data.frame(mt.calculated$T)
+      }
+      
+      write.table(x = vcf.out, file = paste0(paths[i], '/vcf_out.txt'), sep = '\t', quote = F, row.names = F)
+      write.table(x = vcf.timing, file = paste0(paths[i], '/vcf_timing.txt'), sep = '\t', quote = F, row.names = F)
+      
+      # make plot:
+      mcols(cn.GRanges) <- cbind(mcols(cn.GRanges), mt.calculated$T)
+      
+      # save plot
+      pdf(file = paste0(paths[i], '/mt_plot.pdf'), width = 8, height = 8)
+      plotSample(vcf, cn.GRanges)
+      dev.off()
+    }
+  }
+}
+
+
+run.mutationTime(vcf.path = '~/Documents/MSKCC/05_IMPACT40K/tmp/', individual.samples = examples)
+
+
+
+###############################################################################
+## one test example
+examples = c('P-0049082-T01-IM6', 'P-0045744-T01-IM6')
+test.maf = cc.maf[cc.maf$Tumor_Sample_Barcode %in% examples,, drop = F]
+test.cn = read.csv('~/Documents/MSKCC/05_IMPACT40K/tmp/P-0049082-T01-IM6/P-0049082-T01-IM6_P-0049082-N01-IM6_purity.cncf.txt', sep = '\t')
+test.ccf = read.csv('~/Documents/MSKCC/05_IMPACT40K/Data/msk_impact_facets_annotated.ccf.maf', sep = '\t')
+test.ccf = test.ccf[test.ccf$Tumor_Sample_Barcode %in% 'P-0049082-T01-IM6',, drop = F]
+create.vcf(maf.input = cc.maf, sample.list = examples)
+vcf.test = read.csv('~/Documents/MSKCC/05_IMPACT40K/tmp/P-0049082-T01-IM6/vcf_out.txt', sep = '\t')
+vcf.timing = read.csv('~/Documents/MSKCC/05_IMPACT40K/tmp/P-0049082-T01-IM6/vcf_timing.txt', sep = '\t')
+
+
+
+# ## example run from MutationTimeR
+# data(MutationTimeR)
+# mt = MutationTimeR::mutationTime(vcf = vcf, cn = bb, clusters = clusters, n.boot = 10)
+# info(header(vcf)) <- rbind(info(header(vcf)),mtHeader())
+# info(vcf) <- cbind(info(vcf), mt$V)
+# head(vcf)
+# mcols(bb) <- cbind(mcols(bb), mt$T)
+# plotSample(vcf, bb)
+
+
+
+
+
